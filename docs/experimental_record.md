@@ -312,28 +312,34 @@ a820a94 fix(metrics): correct PhiCoefficient (MCC) and FowlkesMallowsIndex
 Experiments root: `/projects/ag-bozek/afatehi/gbm/experiments/` (cluster path;
 authoritative). Prior experiments archived to `…/gbm/experiments.2026/`.
 
-**Loss ablation (F1)** — 5-fold CV cells, each with `cv_results.yaml`
-(per-fold + aggregate) and `results-train/fold_N/best_metrics.yaml`:
-- `lossabl_swin__cont__fold0`, `lossabl_swin__crossentropy__fold0`
-- `lossabl_unet__cont__fold0`, `lossabl_unet__crossentropy__fold0`
-  (the `__fold0` suffix is a naming artifact; each cell holds all 5 folds.)
+Experiment dirs are named `ablation_<arch>_<loss>` (renamed from the internal
+ablation-cell names `lossabl_<arch>__<loss>__fold0`; each dir holds the full
+5-fold CV **and** the all-data final, not just one fold).
 
-**All-data finals + continuity (F2)** — reuse the swin cell dirs; snapshots
-under `results-train/snapshots/all_data/008-16000.pt`:
+**Loss ablation (F1)** — each dir has `cv_results.yaml` (per-fold + aggregate)
+and `results-train/fold_N/best_metrics.yaml`:
+- `ablation_swin_cont`, `ablation_swin_ce`
+- `ablation_unet_cont`, `ablation_unet_ce`
+
+**All-data finals + continuity (F2)** — the two swin dirs; final snapshot
+`results-train/snapshots/all_data/008-16000.pt`:
 - Cont: inference tag `alldata8ep_cont` →
-  `results-infer/alldata8ep_cont_continuity/continuity_result.yaml`
-- CE: inference tag `alldata8ep_ce` → `…alldata8ep_ce_continuity/…`
+  `results-infer/alldata8ep_cont_continuity/continuity_result.yaml`;
+  thickness/visuals under `…/alldata8ep_cont_stats/` (+ blender/render/export).
+- CE: inference tag `alldata8ep_ce` → analogous.
 - Test set = `datasets/ds_test_unlabeled/` (n=62 whole-glom volumes).
 
-**Reproduce a comparison:**
+**Reproduce the continuity comparison:**
 ```
 python gbm.py continuity-compare \
-  lossabl_swin__cont__fold0:alldata8ep_cont \
-  lossabl_swin__crossentropy__fold0:alldata8ep_ce
+  ablation_swin_cont:alldata8ep_cont \
+  ablation_swin_ce:alldata8ep_ce
 ```
 
 W&B: project `gbm-ablation-lyn` (this campaign ran on `lyn`), entity
-`gbm-project`. Runs named `lyn-<cell>-fold-N-eager` + `…-cv-summary`.
+`gbm-project`. NB: W&B run names still carry the OLD cell names
+(`lyn-lossabl_swin__cont-fold-N-eager` + `…-cv-summary`) since those runs
+predate the dir rename — the on-disk dirs are the renamed `ablation_*`.
 
 Snapshots/predictions are large and NOT in git; only code + configs +
 `cv_results.yaml`-scale outputs are. Raw dataset lives outside the repo at the
