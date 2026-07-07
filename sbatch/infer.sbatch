@@ -67,10 +67,12 @@ if [ -z "$SLURM_ARRAY_TASK_ID" ]; then
 
     mkdir -p /home/afatehi/logs/gbm/infer
 
-    # One A100 GPU per task. --array=1-N runs all volumes concurrently
-    # (SLURM queues them as GPUs free up).
+    # One GPU per task (any type). Inference is forward-only and light, so it
+    # need not be pinned to the contended 40 GB A100s -- letting it use the
+    # idle 80 GB (A100+) and V100 nodes avoids long resource waits.
+    # --array=1-N runs all volumes concurrently (SLURM queues as GPUs free up).
     ARRAY_JID=$(sbatch --parsable \
-           --gres=gpu:A100:1 --cpus-per-task=16 --mem=120G \
+           --gres=gpu:1 --cpus-per-task=16 --mem=120G \
            --time=1-00:00:00 --partition=train \
            --array=1-"${N}" \
            --output=/home/afatehi/logs/gbm/infer/job_%A_%a.log \
