@@ -41,14 +41,19 @@ def _as_zhw_bool(_arr: np.ndarray) -> np.ndarray:
     return arr.astype(bool)
 
 
-def continuity_metrics(_mask: np.ndarray) -> dict:
+def continuity_metrics(_mask: np.ndarray, _period: int = 6) -> dict:
     """Z-continuity metrics for one binary (Z, H, W) volume.
 
-    All three measure along-Z smoothness; lower jaggedness == smoother. The
-    per-foreground-voxel normalisation is the fairness control: raw Z-TV is
-    trivially small for a model that simply predicts LESS foreground (fewer
-    boundaries), so we divide the boundary count by the foreground volume and
-    report that volume alongside.
+    The Z-TV / flip / adjacent-IoU family measure *total* along-Z roughness;
+    the per-foreground-voxel normalisation is the fairness control (raw Z-TV
+    is trivially small for a model that predicts LESS foreground). BUT total
+    roughness is dominated by membrane thickness and does NOT capture the
+    visually-obvious jaggedness, which is *terracing*: the label is Z-upsampled
+    by ``np.repeat`` x``_period`` (the z_scale), so a model that memorises that
+    structure concentrates its along-Z transitions at every ``_period``-th
+    slice boundary (flat plateaus + jumps). ``terracing_index`` targets that
+    directly and is the headline for visual smoothness. ``_period`` must match
+    the training ``z_scale`` (default 6).
     """
     mask = _as_zhw_bool(_mask)
     z = mask.shape[0]
@@ -63,6 +68,7 @@ def continuity_metrics(_mask: np.ndarray) -> dict:
             "z_tv_per_fg_voxel": float("nan"),
             "mean_flips_per_fg_column": float("nan"),
             "mean_adjacent_iou": float("nan"),
+            "terracing_index": float("nan"),
             "fg_voxels": fg,
             "fg_fraction": float(fg / mask.size),
             "z_slices": int(z),
@@ -96,11 +102,29 @@ def continuity_metrics(_mask: np.ndarray) -> dict:
     mean_iou = float((inter[valid] / union[valid]).mean()) if valid.any() \
         else float("nan")
 
+    # 5. Terracing index (HEADLINE for visual jaggedness): concentration of
+    #    along-Z transition mass at the dominant period-phase. D(z) is the
+    #    number of boundary crossings at each Z-boundary; if the model memorises
+    #    the x{_period} upsampling, D peaks at every {_period}-th boundary and
+    #    is ~0 within blocks -> high concentration. 1.0 == uniform/smooth,
+    #    up to {_period} == fully terraced. Phase-agnostic (takes the max phase)
+    #    so it does not depend on where the block boundaries land.
+    d_per_boundary = z_diff.sum(axis=(1, 2)).astype(np.float64)   # (Z-1,)
+    d_mean = d_per_boundary.mean()
+    if d_mean > 0 and len(d_per_boundary) >= _period:
+        phase = np.arange(len(d_per_boundary)) % _period
+        terracing_index = float(max(
+            d_per_boundary[phase == ph].mean() / d_mean
+            for ph in range(_period)))
+    else:
+        terracing_index = float("nan")
+
     return {
         "z_tv_per_voxel": float(z_tv_per_voxel),
         "z_tv_per_fg_voxel": float(z_tv_per_fg_voxel),
         "mean_flips_per_fg_column": mean_flips,
         "mean_adjacent_iou": mean_iou,
+        "terracing_index": terracing_index,
         "fg_voxels": fg,
         "fg_fraction": float(fg / mask.size),
         "z_slices": int(z),
@@ -129,7 +153,7 @@ def _aggregate(_per_sample: list, _variant: str) -> dict:
     Non-finite per-sample values (degenerate volumes) are excluded."""
     metric_names = ["z_tv_per_voxel", "z_tv_per_fg_voxel",
                     "mean_flips_per_fg_column", "mean_adjacent_iou",
-                    "fg_voxels", "fg_fraction"]
+                    "terracing_index", "fg_voxels", "fg_fraction"]
     agg = {}
     for name in metric_names:
         vals = np.array(
@@ -190,9 +214,11 @@ def calculate_continuity(_inference_result_path: Path,
     for v, _ in _PRED_VARIANTS:
         a = aggregate.get(v) or {}
         if "z_tv_per_fg_voxel" in a:
+            terr = a.get("terracing_index", {}).get("mean", float("nan"))
             logging.info(
-                "  [%s] Z-TV/fg=%.4f  flips/col=%.3f  adj-IoU=%.4f  (n=%d)",
-                v, a["z_tv_per_fg_voxel"]["mean"],
+                "  [%s] terracing=%.3f  Z-TV/fg=%.4f  flips/col=%.3f  "
+                "adj-IoU=%.4f  (n=%d)",
+                v, terr, a["z_tv_per_fg_voxel"]["mean"],
                 a["mean_flips_per_fg_column"]["mean"],
                 a["mean_adjacent_iou"]["mean"],
                 a["z_tv_per_fg_voxel"]["n"])
@@ -216,8 +242,8 @@ def compare_continuity(_runs: dict) -> dict:
             loaded[label] = yaml.safe_load(f)
 
     table = {}
-    headline = ["z_tv_per_fg_voxel", "mean_flips_per_fg_column",
-                "mean_adjacent_iou", "fg_fraction"]
+    headline = ["terracing_index", "z_tv_per_fg_voxel",
+                "mean_flips_per_fg_column", "mean_adjacent_iou", "fg_fraction"]
     for variant, _ in _PRED_VARIANTS:
         table[variant] = {}
         for metric in headline:

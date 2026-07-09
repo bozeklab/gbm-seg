@@ -46,6 +46,29 @@ def test_smooth_membrane_is_perfectly_continuous():
     assert m["mean_adjacent_iou"] == pytest.approx(1.0)
 
 
+def _terraced_membrane():
+    """A membrane whose XY footprint changes ONLY at period-6 Z-boundaries:
+    flat 6-slice plateaus then a jump == the period-6 stair-stepping that the
+    x6 np.repeat upsampling induces when memorised."""
+    m = np.zeros((18, 32, 32), dtype=bool)
+    m[0:6,   8:16, 8:16] = True
+    m[6:12,  8:16, 16:24] = True   # footprint jumps at z=6
+    m[12:18, 8:16, 8:16] = True    # ...and again at z=12
+    return m
+
+
+def test_terracing_index_flags_period6_stairstepping():
+    # Every-other-slice flips at EVERY Z-boundary equally → no period-6
+    # concentration → terracing_index ~ 1.0 (uniform).
+    uniform = continuity_metrics(_jagged_membrane())["terracing_index"]
+    assert uniform == pytest.approx(1.0, abs=0.05)
+    # Footprint changes only at the period-6 boundaries → transitions are
+    # concentrated there → terracing_index well above 1.
+    terraced = continuity_metrics(_terraced_membrane())["terracing_index"]
+    assert terraced > 2.0
+    assert terraced > uniform
+
+
 def test_flip_count_matches_known_pattern():
     # Slab on slices {0,1,2}, absent on {3..}: each foreground column is
     # present for 3 slices then off → exactly ONE 1→0 flip along Z.
