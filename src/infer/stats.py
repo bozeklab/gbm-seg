@@ -3,6 +3,7 @@
 
 import json
 import logging
+import math
 import re
 from itertools import combinations
 from pathlib import Path
@@ -20,6 +21,7 @@ from scipy.stats import (
     kurtosis,
     mannwhitneyu,
     norm,
+    rankdata,
     shapiro,
     skew,
 )
@@ -1188,10 +1190,75 @@ def generate_group_figures(_stats_dir: Path, _per_image_records,
     return sorted(p.name for p in pub.iterdir())
 
 
+def _multinomial_count(_sizes):
+    """Number of distinct group-label assignments for the given group sizes."""
+    n = sum(_sizes)
+    c = math.factorial(n)
+    for s in _sizes:
+        c //= math.factorial(s)
+    return c
+
+
+def exact_kruskal_permutation_p(_group_values, _max_perms=1_000_000):
+    """Exact (fully enumerated) permutation p-value for the Kruskal-Wallis
+    statistic.
+
+    Enumerates every distinct assignment of the fixed group sizes to the pooled
+    ranks and returns the fraction with H >= H_observed. This is the p-value to
+    report at small n (< ~5 animals per group), where scipy.kruskal's chi-square
+    approximation is not valid. Returns ``None`` when the number of assignments
+    exceeds ``_max_perms`` — in that (large-n) regime the asymptotic p is
+    accurate, so exact enumeration is unnecessary.
+
+    Note: at the mouse level a perfectly rank-separated k-group design hits the
+    maximum attainable H, so the returned p is the design *floor* (the smallest
+    p the geometry can produce) — it certifies rank separation, not effect
+    magnitude. Report it beside effect sizes, not in place of them.
+    """
+    groups = [np.asarray(v, dtype=float) for v in _group_values]
+    sizes = [len(g) for g in groups]
+    n = sum(sizes)
+    if n < 2 or _multinomial_count(sizes) > _max_perms:
+        return None
+    ranks = rankdata(np.concatenate(groups))
+    const = 12.0 / (n * (n + 1))
+
+    def _h(blocks):
+        return const * sum(ranks[b].sum() ** 2 / len(b) for b in blocks) - 3 * (n + 1)
+
+    offset, obs_blocks = 0, []
+    for s in sizes:
+        obs_blocks.append(np.arange(offset, offset + s))
+        offset += s
+    h_obs = _h(obs_blocks)
+
+    count = total = 0
+
+    def _recurse(remaining, si, chosen):
+        nonlocal count, total
+        if si == len(sizes) - 1:                     # last block takes the rest
+            total += 1
+            if _h(chosen + [np.array(remaining)]) >= h_obs - 1e-9:
+                count += 1
+            return
+        for combo in combinations(remaining, sizes[si]):
+            rem = [i for i in remaining if i not in combo]
+            _recurse(rem, si + 1, chosen + [np.array(combo)])
+
+    _recurse(list(range(n)), 0, [])
+    return {"H": float(h_obs), "count": count, "total": total,
+            "p_exact": count / total}
+
+
 def compute_group_significance(_per_sample_summary):
     """Run an omnibus Kruskal-Wallis across all detected groups plus
     pairwise Mann-Whitney U tests with Bonferroni correction. Effect sizes
     (Cliff's delta) are reported alongside p-values.
+
+    When any group has n < 5, the chi-square p from ``kruskal`` is unreliable, so
+    the exact enumerated permutation p (``exact_kruskal_permutation_p``) is added
+    to the omnibus block as ``p_exact`` — that is the value to report at the
+    mouse (biological-replicate) level.
 
     Input: a list of dicts each with 'sample_name', 'group', 'mean'.
     Returns a dict suitable for yaml serialization.
@@ -1222,10 +1289,22 @@ def compute_group_significance(_per_sample_summary):
 
     # Omnibus: H_0 that all groups have the same distribution.
     h, p = kruskal(*eligible.values())
-    out["omnibus"] = {
+    omnibus = {
         "test": "Kruskal-Wallis", "statistic": float(h), "p_value": float(p),
         "groups_tested": list(eligible.keys()),
     }
+    # At small n (any group < 5), the chi-square p_value is not trustworthy; add
+    # the exact enumerated permutation p — the value to report at this size.
+    if any(len(v) < 5 for v in eligible.values()):
+        exact = exact_kruskal_permutation_p(list(eligible.values()))
+        if exact is not None:
+            omnibus["p_exact"] = exact["p_exact"]
+            omnibus["p_exact_fraction"] = f"{exact['count']}/{exact['total']}"
+            omnibus["p_note"] = (
+                "n<5 in at least one group: the asymptotic chi-square p_value is "
+                "unreliable; p_exact is the enumerated permutation p and is the "
+                "value to report.")
+    out["omnibus"] = omnibus
 
     # Pairwise Mann-Whitney with Bonferroni correction over the number of
     # pairs tested. Two-sided.

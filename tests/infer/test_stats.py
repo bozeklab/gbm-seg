@@ -132,6 +132,58 @@ def test_compute_group_significance_reports_groups_with_n1_in_summary_only():
     assert out["omnibus"] is None
 
 
+# --- exact permutation Kruskal-Wallis (small-n group comparison) -----------
+
+def test_exact_kruskal_permutation_p_perfect_separation_hits_floor():
+    """A perfectly rank-separated 4/3/2 design hits H=7.0 (the design maximum),
+    so the exact permutation p = 6/1260 is the floor for this geometry. Uses the
+    real per-mouse thickness means the paper reports."""
+    from scipy.stats import kruskal
+    control = [382.5, 383.7, 387.9, 390.1]
+    podocin = [444.6, 446.2, 493.3]
+    collagen = [347.2, 377.7]
+    res = S.exact_kruskal_permutation_p([control, podocin, collagen])
+    assert res is not None
+    assert abs(res["H"] - 7.0) < 1e-9
+    assert res["count"] == 6 and res["total"] == 1260
+    assert abs(res["p_exact"] - 6 / 1260) < 1e-12
+    # H must match scipy's Kruskal-Wallis (distinct values => no ties).
+    h_scipy, _ = kruskal(control, podocin, collagen)
+    assert abs(res["H"] - h_scipy) < 1e-9
+
+
+def test_exact_kruskal_permutation_p_none_when_intractable():
+    """Beyond the enumeration cap it returns None — the asymptotic p is accurate
+    in that (large-n) regime, so exact enumeration is skipped."""
+    groups = [list(range(30)), list(range(30, 60)), list(range(60, 90))]
+    assert S.exact_kruskal_permutation_p(groups, _max_perms=1000) is None
+
+
+def test_compute_group_significance_adds_exact_p_at_small_n():
+    """With <5 animals per group the omnibus block must carry the exact
+    permutation p (the value to report), not only the chi-square approximation."""
+    means = {"Control": [382.5, 383.7, 387.9, 390.1],
+             "Podocin": [444.6, 446.2, 493.3],
+             "Collagen": [347.2, 377.7]}
+    summary = [{"sample_name": f"{g}{i}", "group": g, "mean": m}
+               for g, vals in means.items() for i, m in enumerate(vals)]
+    omni = S.compute_group_significance(summary)["omnibus"]
+    assert abs(omni["statistic"] - 7.0) < 1e-9
+    assert omni["p_exact_fraction"] == "6/1260"
+    assert abs(omni["p_exact"] - 6 / 1260) < 1e-9
+    assert "p_note" in omni
+
+
+def test_compute_group_significance_no_exact_p_at_large_n():
+    """When every group has n>=5 the exact enumeration is skipped (asymptotic p
+    is valid and full enumeration would be astronomically large)."""
+    summary = ([{"sample_name": f"a{i}", "group": "A", "mean": 100.0 + i}
+                for i in range(6)]
+               + [{"sample_name": f"b{i}", "group": "B", "mean": 500.0 + i}
+                  for i in range(6)])
+    assert "p_exact" not in S.compute_group_significance(summary)["omnibus"]
+
+
 # --- left-censored lognormal MLE -------------------------------------------
 
 def test_censored_mle_uncensored_matches_observed_mean():
