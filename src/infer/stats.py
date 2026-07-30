@@ -14,16 +14,11 @@ import tifffile
 import yaml
 from plotly.subplots import make_subplots
 from scipy.ndimage import binary_opening
-from scipy.optimize import minimize
 from scipy.stats import (
     gaussian_kde,
     kruskal,
-    kurtosis,
     mannwhitneyu,
-    norm,
     rankdata,
-    shapiro,
-    skew,
 )
 
 # Hard biological upper limit on GBM thickness, in nanometres.
@@ -506,86 +501,6 @@ def _subsample(_arr, _n=20000, _seed=88233474):
     rng = np.random.default_rng(_seed)
     idx = rng.choice(arr.size, size=_n, replace=False)
     return arr[idx]
-
-
-def compute_normality_report(_samples_data, _sample_names, _max_shapiro=5000):
-    """Per-sample distribution diagnostics that validate the lognormal
-    assumption behind the left-censored MLE correction.
-
-    For each sample we test the RAW thickness and the LOG-transformed
-    thickness for normality (Shapiro-Wilk), and report skewness + excess
-    kurtosis. If the log-transformed data is "more normal" than the raw
-    data (higher Shapiro W), the lognormal model is the better fit — which
-    is the assumption the censored MLE relies on.
-
-    Shapiro-Wilk is capped at N=5000 (its valid range); larger samples are
-    deterministically subsampled.
-
-    Returns a dict suitable for yaml serialisation.
-    """
-    report = {
-        "method": (
-            "Shapiro-Wilk normality test on raw vs log-transformed "
-            "thickness (subsampled to N<=5000), plus skewness and excess "
-            "kurtosis. Log-normality is supported when the log-transformed "
-            "data has the higher Shapiro W statistic. Computed on the "
-            "less-processed data (post hard-cap + COL4 mask, BEFORE IQR "
-            "outlier removal) so tail-clipping does not artificially "
-            "depress the normality statistic. The QQ grid is the visual "
-            "arbiter — read it for samples where lognormal_preferred is "
-            "False, since truncation/censoring can still distort the test."),
-        "samples": [],
-    }
-    n_supports_lognormal = 0
-    n_total = 0
-    for data, name in zip(_samples_data, _sample_names):
-        data = np.asarray(data, dtype=float)
-        data = data[data > 0]
-        if data.size < 8:
-            report["samples"].append({
-                "sample_name": name, "n": int(data.size),
-                "note": "too few positive voxels for normality testing"})
-            continue
-        sub = _subsample(data, _max_shapiro)
-        log_sub = np.log(sub)
-        try:
-            w_raw, p_raw = shapiro(sub)
-            w_log, p_log = shapiro(log_sub)
-        except Exception as e:  # noqa: BLE001
-            report["samples"].append({
-                "sample_name": name, "n": int(data.size),
-                "note": f"shapiro failed: {e}"})
-            continue
-        lognormal_preferred = bool(w_log > w_raw)
-        n_total += 1
-        if lognormal_preferred:
-            n_supports_lognormal += 1
-        report["samples"].append({
-            "sample_name": name,
-            "n": int(data.size),
-            "n_tested": int(sub.size),
-            "shapiro_W_raw": float(w_raw),
-            "shapiro_p_raw": float(p_raw),
-            "shapiro_W_log": float(w_log),
-            "shapiro_p_log": float(p_log),
-            "skewness_raw": float(skew(sub)),
-            "excess_kurtosis_raw": float(kurtosis(sub)),
-            "skewness_log": float(skew(log_sub)),
-            "excess_kurtosis_log": float(kurtosis(log_sub)),
-            "lognormal_preferred": lognormal_preferred,
-        })
-    if n_total > 0:
-        report["summary"] = {
-            "n_samples_tested": n_total,
-            "n_lognormal_preferred": n_supports_lognormal,
-            "fraction_lognormal_preferred": float(n_supports_lognormal / n_total),
-            "interpretation": (
-                "Fraction of samples where the log-transform is closer to "
-                "normal than the raw values. Close to 1.0 supports the "
-                "lognormal model used by the censored-MLE thickness "
-                "correction."),
-        }
-    return report
 
 
 def _shared_ymax(_samples_data, _hi_percentile=99.0, _pad=1.10, _floor=100.0):
@@ -1129,8 +1044,8 @@ def generate_group_figures(_stats_dir: Path, _per_image_records,
 
     `_per_image_records` is a list of dicts (name, mouse, group, mean,
     voxels, preiqr). Produces the four figures (PNG+PDF+SVG), the per-mouse
-    and per-image significance YAMLs, the per-animal rollup, and the
-    lognormal normality report. Returns the figure base-names."""
+    and per-image significance YAMLs, and the per-animal rollup. Returns the
+    figure base-names."""
     pub = _stats_dir / "publication"
     pub.mkdir(parents=True, exist_ok=True)
     if not _per_image_records:
@@ -1165,14 +1080,6 @@ def generate_group_figures(_stats_dir: Path, _per_image_records,
     with open(pub / "group_significance_by_image.yaml", "w", encoding="UTF-8") as f:
         yaml.safe_dump(image_sig, f, sort_keys=False)
     _write_mouse_summary(pub, per_mouse)
-    try:
-        rep = compute_normality_report(
-            [r.get("preiqr", r["voxels"]) for r in _per_image_records],
-            [r["name"] for r in _per_image_records])
-        with open(pub / "normality_report.yaml", "w", encoding="UTF-8") as f:
-            yaml.safe_dump(rep, f, sort_keys=False)
-    except Exception as e:  # noqa: BLE001
-        logging.warning("Normality report failed: %s", e)
 
     save_group_violin_comparison(per_image_tuples, per_mouse_tuples,
                                  voxels_by_group,
@@ -1396,135 +1303,6 @@ def detect_mouse_id(_sample_name):
     return "Unknown"
 
 
-def fit_lognormal_left_censored(_observed, _n_censored, _censoring_threshold_nm):
-    """Maximum-likelihood fit of a lognormal distribution to data with
-    left-censoring at a known threshold (the PSF resolution limit).
-
-    The morph algorithm reports thickness = 0 for surface voxels where
-    measured² < PSF², i.e. the true thickness is below resolution. The
-    observed (>0) voxels are a left-censored sample of the true thickness
-    distribution. Averaging only the observed values overestimates the
-    true mean because the lower tail of the distribution is missing.
-
-    This function fits the parameters (mu, sigma) of the lognormal
-    distribution from which the full (uncensored) data are drawn, using
-    the log-likelihood:
-
-        L(mu, sigma | data) = sum_i log f(x_i; mu, sigma)             (uncensored part)
-                            + n_censored * log F(threshold; mu, sigma) (censored part)
-
-    where f / F are the lognormal pdf / cdf. Mean of the recovered
-    distribution is ``exp(mu + sigma**2 / 2)`` — the bias-corrected mean.
-    A 95% CI on the mean is computed via the delta method using the
-    Hessian-based covariance of the MLE.
-
-    Returns a dict of (mu, sigma, mean_nm, median_nm, ci_lo_nm, ci_hi_nm,
-    n_observed, n_censored, censoring_threshold_nm, converged). Returns
-    NaN-filled values if the fit fails (too few observations, optimiser
-    didn't converge, etc.) — never raises.
-    """
-    nan_result = {
-        'mu': float('nan'), 'sigma': float('nan'),
-        'mean_nm': float('nan'), 'median_nm': float('nan'),
-        'ci_lo_nm': float('nan'), 'ci_hi_nm': float('nan'),
-        'n_observed': int(len(_observed)),
-        'n_censored': int(_n_censored),
-        'censoring_threshold_nm': float(_censoring_threshold_nm),
-        'converged': False,
-    }
-    obs = np.asarray(_observed, dtype=float)
-    obs = obs[obs > 0]  # strictly positive — lognormal support
-    if obs.size < 5:
-        nan_result['reason'] = 'too few observed voxels'
-        return nan_result
-
-    log_obs = np.log(obs)
-    log_thresh = np.log(_censoring_threshold_nm)
-
-    def neg_log_likelihood(params):
-        mu, log_sigma = params
-        sigma = float(np.exp(log_sigma))
-        if sigma <= 0 or not np.isfinite(sigma):
-            return 1e12
-        # Uncensored term: sum of lognormal log-pdf at each observation.
-        # log f(x) = -log(x) - log(sigma) - 0.5*log(2*pi) - 0.5*((log(x)-mu)/sigma)**2
-        ll_obs = float((-log_obs - log_sigma
-                        - 0.5 * np.log(2.0 * np.pi)
-                        - 0.5 * ((log_obs - mu) / sigma) ** 2).sum())
-        # Censored term: n_censored × log P(X < threshold). For lognormal,
-        # P(X<x) = Phi((log(x) - mu)/sigma).
-        z = (log_thresh - mu) / sigma
-        ll_cen = float(_n_censored) * float(norm.logcdf(z)) if _n_censored > 0 else 0.0
-        total = ll_obs + ll_cen
-        if not np.isfinite(total):
-            return 1e12
-        return -total
-
-    # Initial estimates from the observed (positive) part of the data.
-    mu0 = float(np.mean(log_obs))
-    sigma0 = float(np.std(log_obs, ddof=1)) if obs.size > 1 else 0.5
-    sigma0 = max(sigma0, 1e-3)
-
-    # Nelder-Mead is derivative-free and much more robust on this 2-param
-    # objective than BFGS (which often reports "precision loss" near the
-    # optimum because the curvature in log-sigma is high). The objective
-    # itself is well-behaved so we trust whatever minimum NM finds.
-    res = minimize(neg_log_likelihood, x0=[mu0, np.log(sigma0)],
-                   method='Nelder-Mead',
-                   options={'xatol': 1e-6, 'fatol': 1e-6, 'maxiter': 5000})
-    if not res.success:
-        nan_result['reason'] = f'optimiser did not converge: {res.message}'
-        return nan_result
-
-    mu, log_sigma = res.x
-    sigma = float(np.exp(log_sigma))
-    mean = float(np.exp(mu + sigma ** 2 / 2.0))
-    median = float(np.exp(mu))
-
-    # Delta-method CI for the mean. Nelder-Mead doesn't return a Hessian,
-    # so we estimate it numerically by second differences on the optimum.
-    ci_lo = ci_hi = float('nan')
-    try:
-        eps = 1e-4
-        f0 = neg_log_likelihood([mu, log_sigma])
-        # Diagonal Hessian entries (cheaper than full numerical Hessian).
-        f_mu_plus  = neg_log_likelihood([mu + eps, log_sigma])
-        f_mu_minus = neg_log_likelihood([mu - eps, log_sigma])
-        f_ls_plus  = neg_log_likelihood([mu, log_sigma + eps])
-        f_ls_minus = neg_log_likelihood([mu, log_sigma - eps])
-        h_mu_mu = (f_mu_plus + f_mu_minus - 2 * f0) / eps ** 2
-        h_ls_ls = (f_ls_plus + f_ls_minus - 2 * f0) / eps ** 2
-        # Off-diagonal (mu, log_sigma).
-        f_pp = neg_log_likelihood([mu + eps, log_sigma + eps])
-        f_pm = neg_log_likelihood([mu + eps, log_sigma - eps])
-        f_mp = neg_log_likelihood([mu - eps, log_sigma + eps])
-        f_mm = neg_log_likelihood([mu - eps, log_sigma - eps])
-        h_off = (f_pp + f_mm - f_pm - f_mp) / (4 * eps ** 2)
-        hess = np.array([[h_mu_mu, h_off], [h_off, h_ls_ls]])
-        hess_inv = np.linalg.inv(hess)
-        grad = np.array([mean, mean * sigma ** 2])
-        var_mean = float(grad @ hess_inv @ grad)
-        if var_mean > 0 and np.isfinite(var_mean):
-            se_mean = float(np.sqrt(var_mean))
-            ci_lo = float(mean - 1.96 * se_mean)
-            ci_hi = float(mean + 1.96 * se_mean)
-    except (ValueError, np.linalg.LinAlgError, FloatingPointError):
-        pass
-
-    return {
-        'mu': float(mu),
-        'sigma': float(sigma),
-        'mean_nm': mean,
-        'median_nm': median,
-        'ci_lo_nm': ci_lo,
-        'ci_hi_nm': ci_hi,
-        'n_observed': int(obs.size),
-        'n_censored': int(_n_censored),
-        'censoring_threshold_nm': float(_censoring_threshold_nm),
-        'converged': True,
-    }
-
-
 # Per-sample analysis parameters (shared by the single-process and the
 # array-parallel paths).
 _ALPHA_STEP = 10
@@ -1609,7 +1387,7 @@ def _process_loaded_variant(_sample_name: str, _variant_stats_dir: Path,
     """Run the per-sample stats for ONE mask variant from preloaded data.
 
     Optionally applies the COL4 mask (when `_apply_mask`), then IQR outlier
-    removal + summary + censored MLE, and writes the per-sample plots into
+    removal + summary, and writes the per-sample plots into
     ``<variant_stats_dir>/<sample>/``. Returns the result dict or None. The
     input volume is copied so the two variants never interfere."""
     sample_hist_dir = _variant_stats_dir / _sample_name
@@ -1638,7 +1416,7 @@ def _process_loaded_variant(_sample_name: str, _variant_stats_dir: Path,
         # Log-scale Tukey fences — thickness is right-skewed, so a raw-scale
         # symmetric fence would clip the thick-membrane tail and bias the
         # mean down. data_clean is the descriptive box / violin / per-sample
-        # mean; the censored MLE below is fit on the LESS-processed data.
+        # mean.
         data_clean = remove_outliers_iqr(data_no_zeros, _log=True)
         if len(data_clean) == 0:
             logging.warning("Sample %s (%s): no voxels left after outlier removal",
@@ -1654,25 +1432,11 @@ def _process_loaded_variant(_sample_name: str, _variant_stats_dir: Path,
         mean = float(np.mean(data_clean))
         std = float(np.std(data_clean, ddof=1)) if len(data_clean) > 1 else 0.0
 
-        # Bias-corrected mean via left-censored lognormal MLE, fit on the
-        # pre-IQR data (only PSF-censoring is modelled).
-        if clamp is not None:
-            n_cens = int(clamp.get('clamp_count', 0))
-            psf_lat = float(clamp.get('psf_lateral_nm', 149))
-        else:
-            n_cens, psf_lat = 0, 149.0
-        censored_fit = fit_lognormal_left_censored(data_no_zeros, n_cens, psf_lat)
-
         summary = {
             'sample_name': _sample_name, 'group': sample_group,
             'q1': float(q1), 'median': float(median), 'q3': float(q3),
             'lowerfence': float(lowerfence), 'upperfence': float(upperfence),
             'mean': mean, 'std': std,
-            'censored_mean': float(censored_fit['mean_nm']),
-            'censored_median': float(censored_fit['median_nm']),
-            'censored_ci_lo': float(censored_fit['ci_lo_nm']),
-            'censored_ci_hi': float(censored_fit['ci_hi_nm']),
-            'censored_converged': bool(censored_fit['converged']),
         }
 
         for bins in _BIN_SIZES:
@@ -1794,18 +1558,11 @@ def _reduce_and_write(_stats_dir: Path, _inference_result_path: Path,
         dtype = [('sample_name', 'U100'), ('group', 'U32'),
                  ('q1', 'f8'), ('median', 'f8'), ('q3', 'f8'),
                  ('lowerfence', 'f8'), ('upperfence', 'f8'),
-                 ('mean', 'f8'), ('std', 'f8'),
-                 # Bias-corrected (left-censored lognormal MLE) fields.
-                 ('censored_mean', 'f8'), ('censored_median', 'f8'),
-                 ('censored_ci_lo', 'f8'), ('censored_ci_hi', 'f8'),
-                 ('censored_converged', '?')]
+                 ('mean', 'f8'), ('std', 'f8')]
         # Use a fixed key order so the structured array fields line up with
         # `dtype` regardless of Python dict insertion order quirks.
         field_order = ['sample_name', 'group', 'q1', 'median', 'q3',
-                       'lowerfence', 'upperfence', 'mean', 'std',
-                       'censored_mean', 'censored_median',
-                       'censored_ci_lo', 'censored_ci_hi',
-                       'censored_converged']
+                       'lowerfence', 'upperfence', 'mean', 'std']
         records = [tuple(d[k] for k in field_order) for d in summary_data_list]
         summary_array = np.array(records, dtype=dtype)
         summary_file = _stats_dir / "summary_statistics.npz"
@@ -1825,15 +1582,9 @@ def _reduce_and_write(_stats_dir: Path, _inference_result_path: Path,
 
     # Sample-weighted aggregate — equal weight per sample. This is the
     # appropriate aggregation for biological / clinical comparisons where
-    # each sample is one biological unit, not one voxel. Both the raw and
-    # the bias-corrected (left-censored lognormal MLE) means are
-    # aggregated; the censored version is what to cite as the unbiased
-    # cohort-mean estimate when PSF clamping is non-negligible.
+    # each sample is one biological unit, not one voxel.
     if summary_clean:
         sample_means = np.array([float(d['mean']) for d in summary_clean])
-        cens_means = np.array([float(d['censored_mean'])
-                                for d in summary_clean
-                                if np.isfinite(d.get('censored_mean', float('nan')))])
         sample_weighted = {
             "n_samples": int(len(sample_means)),
             "raw": {
@@ -1842,24 +1593,8 @@ def _reduce_and_write(_stats_dir: Path, _inference_result_path: Path,
                 "sem": (float(np.std(sample_means, ddof=1) / np.sqrt(len(sample_means)))
                         if len(sample_means) > 1 else 0.0),
                 "median_of_sample_means": float(np.median(sample_means)),
-                "note": ("Raw mean — biased upward when PSF clamping is "
-                         "non-trivial. Use the `censored` block for "
-                         "publication-grade cohort means."),
             },
         }
-        if cens_means.size > 0:
-            sample_weighted["censored"] = {
-                "n_samples": int(cens_means.size),
-                "mean_of_sample_means": float(np.mean(cens_means)),
-                "std_of_sample_means": float(np.std(cens_means, ddof=1)) if cens_means.size > 1 else 0.0,
-                "sem": (float(np.std(cens_means, ddof=1) / np.sqrt(cens_means.size))
-                        if cens_means.size > 1 else 0.0),
-                "median_of_sample_means": float(np.median(cens_means)),
-                "method": ("Per-sample lognormal MLE with left-censoring "
-                           "at the lateral PSF resolution (149 nm); the "
-                           "cohort-level mean is the mean of those per-"
-                           "sample bias-corrected means."),
-            }
         sw_path = _stats_dir / "sample_weighted_aggregate.yaml"
         with open(sw_path, "w", encoding="UTF-8") as f:
             yaml.safe_dump(sample_weighted, f, sort_keys=False)
@@ -1959,8 +1694,6 @@ def _reduce_and_write(_stats_dir: Path, _inference_result_path: Path,
                     "(** cite this **)\n")
             f.write("  - group_significance_by_image.yaml  tests on IMAGE means "
                     "(transparency; overstates n via pseudoreplication)\n")
-            f.write("  - normality_report.yaml       Shapiro-Wilk raw vs log "
-                    "(validates the lognormal / censored-MLE assumption)\n")
 
         if clamp_stats_list:
             f.write("\nPSF clamp activation (% of surface voxels where measured² < PSF²):\n")

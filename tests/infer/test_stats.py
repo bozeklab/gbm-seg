@@ -184,47 +184,6 @@ def test_compute_group_significance_no_exact_p_at_large_n():
     assert "p_exact" not in S.compute_group_significance(summary)["omnibus"]
 
 
-# --- left-censored lognormal MLE -------------------------------------------
-
-def test_censored_mle_uncensored_matches_observed_mean():
-    """With zero censoring, the lognormal MLE mean should be close to the
-    sample mean of a synthetic lognormal dataset."""
-    rng = np.random.default_rng(seed=42)
-    mu_true, sigma_true = np.log(400.0), 0.4
-    data = rng.lognormal(mu_true, sigma_true, size=5000)
-    fit = S.fit_lognormal_left_censored(data, _n_censored=0,
-                                         _censoring_threshold_nm=149.0)
-    assert fit['converged']
-    # Theoretical mean of the lognormal is exp(mu + sigma^2/2).
-    theoretical_mean = np.exp(mu_true + sigma_true**2 / 2)
-    assert abs(fit['mean_nm'] - theoretical_mean) / theoretical_mean < 0.05
-
-
-def test_censored_mle_recovers_truncated_mean():
-    """When the dataset is left-truncated at PSF (we drop voxels < PSF)
-    and we tell the MLE about it, it should recover a mean closer to the
-    full-distribution mean than the simple mean of the truncated data."""
-    rng = np.random.default_rng(seed=7)
-    mu_true, sigma_true = np.log(300.0), 0.5
-    full_data = rng.lognormal(mu_true, sigma_true, size=10000)
-    psf = 149.0
-    truncated = full_data[full_data > psf]
-    n_censored = int(np.sum(full_data <= psf))
-    naive_mean = float(np.mean(truncated))
-    fit = S.fit_lognormal_left_censored(truncated, n_censored, psf)
-    true_mean = np.exp(mu_true + sigma_true**2 / 2)
-    assert fit['converged']
-    # The MLE should be measurably closer to the truth than the naive mean.
-    assert abs(fit['mean_nm'] - true_mean) < abs(naive_mean - true_mean)
-
-
-def test_censored_mle_handles_too_few_observations():
-    fit = S.fit_lognormal_left_censored(np.array([200.0]),
-                                         _n_censored=10, _censoring_threshold_nm=149.0)
-    assert not fit['converged']
-    assert np.isnan(fit['mean_nm'])
-
-
 # --- publication figures + diagnostics -------------------------------------
 
 def test_group_color_stable_and_fallback():
@@ -253,27 +212,10 @@ def test_p_to_stars():
     assert S._p_to_stars(float("nan")) == "n/a"
 
 
-def test_normality_report_prefers_lognormal_for_lognormal_data():
-    rng = np.random.default_rng(0)
-    samples = [rng.lognormal(np.log(350), 0.4, 20000),
-               rng.lognormal(np.log(500), 0.45, 20000)]
-    rep = S.compute_normality_report(samples, ["s1", "s2"])
-    assert rep["summary"]["n_samples_tested"] == 2
-    # Lognormal synthetic data → log transform should be preferred for all.
-    assert rep["summary"]["fraction_lognormal_preferred"] == 1.0
-    for s in rep["samples"]:
-        assert s["shapiro_W_log"] > s["shapiro_W_raw"]
-
-
-def test_normality_report_handles_tiny_sample():
-    rep = S.compute_normality_report([np.array([100.0, 200.0])], ["tiny"])
-    assert rep["samples"][0]["note"].startswith("too few")
-
-
 def test_generate_group_figures_writes_full_set(tmp_path):
     """End-to-end: the curated set (violin/ridgeline/ecdf/estimation) in
-    PNG+PDF+SVG, plus the two significance YAMLs, mouse summary and normality
-    report. Guards the new publication output contract."""
+    PNG+PDF+SVG, plus the two significance YAMLs and mouse summary.
+    Guards the new publication output contract."""
     recs = _multi_group_records()
     written = S.generate_group_figures(tmp_path, recs)
     pub = tmp_path / "publication"
@@ -284,7 +226,7 @@ def test_generate_group_figures_writes_full_set(tmp_path):
             assert (pub / f"{stem}.{ext}").exists(), f"missing {stem}.{ext}"
     for y in ("group_significance_by_mouse.yaml",
               "group_significance_by_image.yaml",
-              "mouse_summary.yaml", "normality_report.yaml"):
+              "mouse_summary.yaml"):
         assert (pub / y).exists(), f"missing {y}"
         assert y in written
 
