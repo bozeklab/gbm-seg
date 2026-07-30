@@ -155,7 +155,7 @@ trainer:
     #                        - {name: Dice,         weight: 0.5}
     loss:
       name: Cont
-      weights: [3.0, 7.0]
+      weights: [0.05, 0.95]
       # ContLoss-only fields (consulted iff name=Cont). Defaults approximate the
       # prior learned-weight initialisation equilibrium.
       cont_alpha: 0.7
