@@ -213,10 +213,10 @@ def _resize_one_tiff(_task):
             wga = zoom(wga, zoom_factors, order=1, prefilter=False)
 
             if has_labels:
-                labels = zoom(labels, zoom_factors, order=1, prefilter=False)
-                threshold = 0.5
-                labels[labels >= threshold] = 255
-                labels[labels < threshold] = 0
+                # Nearest-neighbor for the discrete label channel (matches the
+                # zoom augmentation's cv2.INTER_NEAREST): resample labels without
+                # interpolation, so no bilinear blur or threshold re-binarization.
+                labels = zoom(labels, zoom_factors, order=0, prefilter=False)
 
             if resized_nephrin_stack is None:
                 resized_shape = (voxel_space.shape[0],
